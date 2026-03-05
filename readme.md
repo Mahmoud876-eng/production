@@ -1,4 +1,5 @@
-
+add a folder called recording
+mkdir recording
 
 ## 📋 Installation
 
@@ -360,3 +361,4 @@ For issues or questions about specific endpoints, check the endpoint documentati
 - What output you'll receive
 - Which memory features are being used
 - Special behaviors or edge cases
+
