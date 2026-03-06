@@ -1,4 +1,5 @@
-
+add a folder called recording
+mkdir recording
 
 ## 📋 Installation
 
@@ -309,6 +310,83 @@ role: string (e.g., "Senior Python Developer", "Full-stack Engineer")
 
 ---
 
+### 8. **Process PDF for Retrieval**
+**Endpoint:** `POST /process_pdf/`
+
+**What it does:**
+- Uploads and processes PDF documents
+- Extracts text content from all pages
+- Creates vector embeddings for semantic search
+- Stores document data in Redis vector database
+- Prepares documents for retrieval and analysis
+
+**Input:**
+```
+pdf: UploadFile (required) - PDF file to process and index
+```
+
+**Output:**
+```json
+{
+  "status": "File processed successfully and indexed in vector database"
+}
+```
+
+**Features:**
+- **Document Indexing:** Automatically extracts and indexes all content
+- **Vector Embeddings:** Uses Gemini embeddings for semantic understanding
+- **Redis Storage:** Stores vectors for fast retrieval
+- **Multi-page Support:** Handles documents of any length
+
+---
+
+### 9. **Retrieve Content from Vector Database**
+**Endpoint:** `POST /retrieve/`
+
+**What it does:**
+- Searches processed documents using semantic queries
+- Finds most relevant content based on meaning, not just keywords
+- Returns top matching paragraphs with relevance scores
+- Enables intelligent document Q&A and searching
+
+**Input:**
+```
+query: string (required) - Your search query (e.g., "What is photosynthesis?")
+input: string (required) - Additional context or filter
+```
+
+**Output:**
+```json
+{
+  "results": [
+    {
+      "id": "doc_0",
+      "paragraph": "Photosynthesis is the process by which plants...",
+      "vector_distance": 0.125
+    },
+    {
+      "id": "doc-1",
+      "paragraph": "During photosynthesis, plants use light energy...",
+      "vector_distance": 0.156
+    },
+    {
+      "id": "doc_2",
+      "paragraph": "The two main stages of photosynthesis are...",
+      "vector_distance": 0.182
+    }
+  ]
+}
+```
+
+**Features:**
+- **Semantic Search:** Finds relevant content based on meaning
+- **Vector Embeddings:** Uses AI to understand query intent
+- **Top Results:** Returns 3 most relevant matches
+- **Relevance Scoring:** Shows how well each result matches your query
+- **Integration:** Works with documents processed via `/process_pdf/`
+
+---
+
 ## 🧠 System Features
 
 ### AI Models Used
@@ -360,3 +438,4 @@ For issues or questions about specific endpoints, check the endpoint documentati
 - What output you'll receive
 - Which memory features are being used
 - Special behaviors or edge cases
+

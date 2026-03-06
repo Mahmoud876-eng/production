@@ -3,6 +3,7 @@ import os
 from dotenv import load_dotenv
 from shutil import copyfileobj
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain.tools import tool, ToolRuntime  
 from fastapi.encoders import jsonable_encoder
@@ -20,6 +21,10 @@ from langchain_core.messages.utils import trim_messages, count_tokens_approximat
 from langgraph.graph import MessagesState
 from dataclasses import dataclass
 from langgraph.types import Command
+from redisvl.index import SearchIndex
+from redis import Redis
+from redisvl.query import VectorQuery
+
 
 # Load environment variables
 load_dotenv()
@@ -47,8 +52,13 @@ struct_llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
     temperature=0.7,
 )
-embeddings_model = ChatGoogleGenerativeAI(
+doc_embeddings= GoogleGenerativeAIEmbeddings(
     model="gemini-embedding-001",
+    task_type="RETRIEVAL_DOCUMENT"
+)
+query_embeddings = GoogleGenerativeAIEmbeddings(
+    model="gemini-embedding-001",
+    task_type="RETRIEVAL_QUERY"
 )
 tts= ChatGoogleGenerativeAI(
     model="gemini-2.5-flash-preview-tts",
@@ -300,6 +310,14 @@ class state_document(MessagesState):
     pages: dict
     target_age: str
     document_output: Annotated[str, operator.add]
+class state_RAG(TypedDict):
+    pdf_path: str
+    paragraphs: list
+    embeddings: list
+    final_output: list[dict]
+    error: Optional[Annotated[str, operator.add]]  
+    pls_work: dict 
+
 @dataclass
 class Context:
     user_id: str 
@@ -312,6 +330,32 @@ quiz_structured_llm = llm.with_structured_output(quizstructure)
 evaluation_structured_llm = llm.with_structured_output(evaluation_response_structure)
 children_safety_structured_llm = llm.with_structured_output(content_safety_response)
 #end of the llm with structured output
+#creation a vector database with Redis
+schema = {
+    "index": {
+        "name": "documents_index",
+        "prefix": "docs_6",
+    },
+    "fields": [
+        {"name": "id", "type": "tag"},
+        {"name": "paragraph", "type": "text"},
+        {
+            "name": "para_embedding",
+            "type": "vector",
+            "attrs": {
+                "dims": 3072,
+                "distance_metric": "COSINE",
+                "algorithm": "FLAT",
+                "datatype": "FLOAT32",
+            }
+        }
+    ]
+}
+client = Redis.from_url(REDIS_URI)
+index = SearchIndex.from_dict(schema, redis_client=client, validate_on_load=True)
+index.create(overwrite=True)
+#end creating a vector database with Redis
+
 #start tool calling
 #tools for storing long and short term memory  for teh bot
 @tool
@@ -673,6 +717,40 @@ def conditional_edge(state: state_document) -> Literal["2", "3", "4", "5", "6", 
         pages.append(str(i+2))
     pages.append("end_conversation")
     return pages 
+# end of the script avatar workglow
+# start of the RAG functions
+def get_embedding(state: state_RAG) -> state_RAG:
+    try:
+        data=doc_embeddings.embed_documents( state["paragraphs"])
+    except Exception as e:
+        return {"error": str(e)}
+    return {"embeddings": data}
+import numpy as np
+def prepare_for_vector_store(state: state_RAG) -> state_RAG:
+    vector_store_data=[]
+    i=-1
+    for text in state["paragraphs"]:
+        i+=1
+        embedding = state["embeddings"][i]
+        try:
+            vector_store_data.append({
+                "id": f"kid_{i}",
+                "paragraph": text,
+                "para_embedding": np.array(embedding, dtype=np.float32).tobytes(),
+            })
+        except Exception as e:
+            b=f"Error processing embedding for paragraph {i}: {e}"
+            return {"error": str(b)}
+    return {"final_output": vector_store_data}
+def store_redis_db(state: state_RAG) -> state_RAG:
+    i=-1
+    try:
+        keys = index.load(state["final_output"])
+    except Exception as e:
+        return {"error": str(e)}
+    yo=index.schema.fields
+    return {"pls_work": keys}
+#end of the RAG functions 
 
 #end of the not techniclly tools 
 #start the defr to  protect the children from any harmful content
@@ -1066,9 +1144,7 @@ one_page_workflow.add_edge("emotionless script","avatar script")
 one_page_workflow.add_edge("avatar script", "tts avatar")
 one_page_workflow.add_edge("tts avatar", END)
 one_page_chain = one_page_workflow.compile()
-graph_png = one_page_chain.get_graph().draw_mermaid_png() 
-with open("./langGraph/one_page.png", "wb") as f:
-    f.write(graph_png)
+
 agent_avatar = StateGraph(state_document)
 agent_avatar.add_node("load_pdf",load_pdf)
 agent_avatar.add_node("start_conversation",start_conversation)
@@ -1095,10 +1171,24 @@ agent_avatar.add_conditional_edges("start_conversation", conditional_edge)
 agent_avatar.add_edge("end_conversation", END)
 avatar_chain = agent_avatar.compile()
 #ent sub Graph
-graph_png = avatar_chain.get_graph().draw_mermaid_png() 
-with open("./langGraph/newavatar.png", "wb") as f:
-    f.write(graph_png)
 
+#RAG workflow 
+RAG = StateGraph(state_RAG)
+RAG.add_node("load_pdf", load_pdf)
+RAG.add_node("get_embedding", get_embedding)
+RAG.add_node("prepare_for_vector_store", prepare_for_vector_store)
+RAG.add_node("store_redis_db", store_redis_db)
+
+# Add edges
+RAG.add_edge(START, "load_pdf")
+RAG.add_edge("load_pdf", "get_embedding")
+RAG.add_edge("get_embedding", "prepare_for_vector_store")
+RAG.add_edge("prepare_for_vector_store", "store_redis_db")
+RAG.add_edge("store_redis_db", END)
+#RAG.add_edge("get_embedding", END)
+
+RAG_chain = RAG.compile()
+#ent RAG workflow 
 @app.get("/")
 async def index(user_id: str):
     namespace=(user_id,"memories")
@@ -1147,11 +1237,6 @@ async def chatbot(user_input: str, thr_id:str, usr_id: str, file: UploadFile | N
         test_input = {"pdf_path": file_path, "target_age": "high school students"}#exchange it later to be compatible with  state or else the error will persist
         avatar_result  = await avatar_chain.ainvoke(test_input)
         return avatar_result["document_output"]
-    #test = chain.invoke(
-    #    {"messages": [HumanMessage(content=user_input)]},
-    #    config={"configurable": {"thread_id": thr_id}},
-    #    context=Context(user_id=usr_id),
-    #)
     test = run_agent.invoke(
         {"messages": [HumanMessage(content=user_input)]},
         config={"configurable": {"thread_id": thr_id}},
@@ -1174,6 +1259,15 @@ async def chatbot(user_input: str, thr_id:str, usr_id: str, file: UploadFile | N
             print("Tool content is not JSON, skipping redirect check")
             pass
     return {"aimessage": test }#, "content_safety_response": child_protector}
+@app.post('/avatar/')
+async def avatar_script(target_age: str, file: UploadFile | None = None):
+   if file and file.filename:
+        file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+        with open(file_path, "wb") as buffer:
+            copyfileobj(file.file, buffer)
+        test_input = {"pdf_path": file_path, "target_age": target_age }#exchange it later to be compatible with  state or else the error will persist
+        avatar_result  = await avatar_chain.ainvoke(test_input)
+        return avatar_result["document_output"]
 @app.post('/evaluate/')
 async def evaluate_route(data: dict):
     feedback = evaluate_student_and_generate_documentation.invoke({"quiz_answers": data})
@@ -1201,4 +1295,28 @@ async def code_review_route(code: str, role: str):
     """# maybe we will review the role part later to make it more specific
     review = llm.invoke(prompt)
     return {"review": review}
+@app.post("/process_pdf/")
+async def process_pdf(pdf: UploadFile):
+    # Save the uploaded PDF file
+    pdf_path = os.path.join(UPLOAD_FOLDER, pdf.filename)
+    with open(pdf_path, "wb") as f:
+        copyfileobj(pdf.file, f)
+    final_state = RAG_chain.invoke({"pdf_path": pdf_path})
+    #Return the final output as JSON response
+    return {"status": "File processed successfully and indexed in vector database"}
+@app.post("/retrieve/")
+async def retrieve(query: str, input: str):
+    query_embedding = query_embeddings.embed_query(query)
+    query = VectorQuery(
+    vector=query_embedding,
+    vector_field_name="para_embedding",
+    return_fields=["paragraph", "id", "vector_distance"],
+    num_results=3
+    )
+    try:
+        results = index.query(query)
+    except Exception as e:
+        return {"error": f"Query error: {e}"}
+    return {"results": results}
+
 
