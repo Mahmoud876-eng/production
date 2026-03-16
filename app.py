@@ -24,6 +24,7 @@ from langgraph.types import Command
 from redisvl.index import SearchIndex
 from redis import Redis
 from redisvl.query import VectorQuery
+from langchain_azure_ai.chat_models import AzureAIOpenAIApiChatModel
 
 
 # Load environment variables
@@ -32,9 +33,37 @@ load_dotenv()
 # FastAPI app
 app = FastAPI()
 
-# Upload folder configuration
+# Upload fnewolder configuration
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+#azure api configuration
+endpoint = (os.getenv("AZURE_AI_INFERENCE_ENDPOINT") or os.getenv("endpoint") or "").strip().rstrip("/")
+# For /openai/v1 endpoints, api-version is optional; use only AZURE_OPENAI_API_VERSION when explicitly set.
+# Ignore legacy `api_version` env var to avoid accidental unsupported preview versions.
+api_version = os.getenv("AZURE_OPENAI_API_VERSION", "").strip()
+credential = (
+    os.getenv("AZURE_AI_INFERENCE_CREDENTIAL")
+    or os.getenv("AZURE_AI_INFERENCE_CREDENTIAL")
+    or os.getenv("key")
+    or ""
+).strip()
+
+if not endpoint or not credential:
+    raise ValueError(
+        "Azure AI configuration missing. Set AZURE_AI_INFERENCE_ENDPOINT and "
+        "AZURE_AI_INFERENCE_CREDENTIAL (or AZURE_AI_CREDENTIAL)."
+    )
+
+model_kwargs = {
+    "endpoint": endpoint,
+    "credential": credential,
+    "model": "Mistral-Large-3",
+}
+if api_version:
+    model_kwargs["api_version"] = api_version
+
+llm = AzureAIOpenAIApiChatModel(**model_kwargs)
+#end azure api configuration
 
 # Google API configuration
 google_api_key = os.getenv("GOOGLE_API_KEY")
@@ -42,7 +71,7 @@ if not google_api_key:
     raise ValueError("GOOGLE_API_KEY not found in environment variables")
 
 # Initialize Google LLM (replacing Azure OpenAI)
-llm = ChatGoogleGenerativeAI(
+gllm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
     temperature=0.7,
 )
@@ -120,6 +149,7 @@ TOOL WORKFLOW:
 - Use retrieved data to personalize responses
 - Generate quizzes → generate_quiz tool
 - Create study materials → generate_document tool
+- If user shows distress (hyper-stress, severe anxiety, self-harm/suicide signals) → detect_mental_health_risk tool
 - Navigate UI → redirect tools
 
 Communication:
@@ -188,6 +218,42 @@ Return ONLY valid JSON:
 If uncertain, classify as unsafe.
 
 Do not provide advice. Do not rewrite. Only classify.
+"""
+
+mental_health_risk_classifier_prompt = """
+You are a mental health risk signal classifier for educational chat safety triage.
+
+Your task is to detect possible emotional crisis signals in user text, including:
+- Hyper-stress or overwhelm
+- Severe anxiety or panic-like language
+- Hopelessness/despair
+- Self-harm ideation
+- Suicide ideation or intent
+
+Important:
+- You are NOT diagnosing medical conditions.
+- You are performing risk signal classification only.
+- If uncertain between two severities, choose the higher one.
+
+Return ONLY valid JSON in this exact shape:
+{
+    "risk_detected": true or false,
+    "risk_types": ["hyper_stress", "severe_anxiety", "hopelessness", "self_harm", "suicidal_ideation", "other"],
+    "severity": "low | medium | high | critical",
+    "requires_immediate_escalation": true or false,
+    "reason": "brief explanation"
+}
+
+Severity guidance:
+- low: mild stress, no safety indicators
+- medium: persistent distress, no direct self-harm/suicide signal
+- high: indirect self-harm/suicide signals, concerning hopelessness
+- critical: direct self-harm/suicide intent, plans, or imminent risk language
+
+Escalation guidance:
+- requires_immediate_escalation = true for high or critical risk
+
+Only classify. Do not give coping advice or treatment recommendations.
 """
 
 #end system prompts
@@ -287,6 +353,13 @@ class content_safety_response(BaseModel):
     violations: list[str] = Field(..., description="List of triggered content violation categories")
     severity: str = Field(..., description="Severity level of the violations (low, medium, high, critical)")
     reason: str = Field(..., description="Brief explanation of why the content was classified as safe or unsafe")
+
+class mental_health_risk_response(BaseModel):
+    risk_detected: bool = Field(..., description="Whether distress/crisis risk signals are detected")
+    risk_types: list[str] = Field(..., description="Detected risk categories such as hyper_stress, severe_anxiety, hopelessness, self_harm, suicidal_ideation")
+    severity: str = Field(..., description="Risk severity level (low, medium, high, critical)")
+    requires_immediate_escalation: bool = Field(..., description="Whether immediate escalation to a human safety response is needed")
+    reason: str = Field(..., description="Brief explanation for the risk classification")
 #end of the data structure to protect the kids
 #end writing the data structure
 #states
@@ -303,9 +376,15 @@ class state(TypedDict):
     avatar_output: str
     target_age: str
     id: str
+    main_language: str
+    second_language: str
+    main_topic: str
+
 
 class state_document(MessagesState):
     pdf_path: str
+    main_language: str
+    second_language: str
     pdf_content: list[str]
     pages: dict
     target_age: str
@@ -329,6 +408,7 @@ document_structured_llm = llm.with_structured_output(document)
 quiz_structured_llm = llm.with_structured_output(quizstructure)
 evaluation_structured_llm = llm.with_structured_output(evaluation_response_structure)
 children_safety_structured_llm = llm.with_structured_output(content_safety_response)
+mental_health_risk_structured_llm = llm.with_structured_output(mental_health_risk_response)
 #end of the llm with structured output
 #creation a vector database with Redis
 schema = {
@@ -426,10 +506,15 @@ def retrieve_long_term_data(runtime: ToolRuntime[Context]) -> Union[dict, state_
     user_id=runtime.context.user_id
     namespace=(user_id,"memories")
     personal_data=runtime.store.get(namespace,"a-memory")
-    # Convert dict to JSON string to ensure ToolMessage content is string type
-    
+    if personal_data is None:
+        content = "No profile data found."
+    elif isinstance(personal_data, (dict, list)):
+        content = json.dumps(personal_data, ensure_ascii=False)
+    else:
+        content = str(personal_data)
+
     return ToolMessage(
-        content=personal_data if personal_data else "No profile data found.",
+        content=content,
         tool_call_id=runtime.tool_call_id  # Critical: pairs response with the call
     )
 #@tool    
@@ -478,7 +563,49 @@ def sumurize_avatar(state: state) -> state:
     return state
 
 async def script(state: state) -> state:
-    system_prompt = """Transform this educational page into a clear, engaging learning script.
+    # Get multilingual parameters
+    main_language = state["main_language"]
+    second_language = state["second_language"]
+    
+    # Build language mixing instructions
+    multilingual_instructions = ""
+    if main_language != "English" or second_language != "English":
+        multilingual_instructions = f"""
+
+MULTILINGUAL HYBRID LANGUAGE INSTRUCTIONS:
+============================================
+Main Language (Student's Primary Language): {main_language}
+Secondary Language (Documentation/Scientific Language): {second_language}
+
+LANGUAGE MIXING STRATEGY:
+1. Use {main_language} for ALL explanations, examples, step-by-step instructions, and illustrations
+2. Use {second_language} ONLY for:
+   - Scientific/technical terminology that has no direct {main_language} equivalent
+   - Mathematical formulas and symbols
+   - Chemical names and formulas
+   - Standard technical definitions
+   - Proper nouns and scientific names
+
+3. When introducing scientific terms:
+   - First explain the concept fully in {main_language}
+   - Provide concrete examples in {main_language}
+   - Then give the {second_language} scientific term in parentheses
+   - Example: "This process (called [scientific_term]) works by..."
+
+4. HYBRID OUTPUT PATTERN:
+   - Narrative & Examples: 100% {main_language}
+   - Complex Explanations: 60% {main_language} + 40% {second_language} terminology
+   - Definitions: State in {main_language}, reference {second_language} term
+   - Analogies: Always in {main_language}, use familiar student experiences
+   - Step-by-step methods: Completely in {main_language}
+
+5. PRIORITY:
+   - Student comprehension in {main_language} is paramount
+   - Use {main_language} to explain complicated methods and examples
+   - Use {second_language} only for scientific accuracy and technical precision
+   - Maintain flow and readability in {main_language}"""
+    
+    system_prompt = f"""Transform this educational page into a clear, engaging learning script.
 
 REQUIREMENTS:
 
@@ -508,7 +635,7 @@ REQUIREMENTS:
    - Patient and supportive
    - Foster genuine curiosity about the topic
 
-Transform this page into an engaging educational explanation without artificially adding introduction/conclusion—just enhance and clarify what's already here."""
+Transform this page into an engaging educational explanation without artificially adding introduction/conclusion—just enhance and clarify what's already here.{multilingual_instructions}"""
 	
     user_message = f"""PAGE CONTENT:
 {state["page"]}
@@ -522,7 +649,8 @@ Create a smooth, flowing educational explanation of this page's content."""
 	]
 	
     script_response = await llm.ainvoke(messages)
-    state["script_avatar"] = str(script_response.content)
+    #state["script_avatar"] = str(script_response.content)
+    state["avatar_output"] = str(script_response.content)
     return state
 async def avatar(state: state) -> state:
     system_prompt = f"""You are a voice director for Gemini TTS.
@@ -586,78 +714,84 @@ async def tts_avatar(state: state) -> state:
 
 async def second_page_summary(state: state_document) -> state_document:
 	page = state["pages"][1]
-	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "2"})
+	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "2"})
 	return {"document_output": response["avatar_output"]}
 
 
 async def third_page_summary(state: state_document) -> state_document:
 	page = state["pages"][2]
-	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "3"})
+	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "3"})
 	return {"document_output": response["avatar_output"]}
 
 
 async def fourth_page_summary(state: state_document) -> state_document:
 	page = state["pages"][3]
-	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "4"})
+	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "4"})
 	return {"document_output": response["avatar_output"]}
 async def fifth_page_summary(state: state_document) -> state_document:
 	page = state["pages"][4]
-	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "5"})
+	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "5"})
 	return {"document_output": response["avatar_output"]}
 
 async def sixth_page_summary(state: state_document) -> state_document:
 	page = state["pages"][5]
-	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "6"})
+	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "6"})
 	return {"document_output": response["avatar_output"]}
 async def seventh_page_summary(state: state_document) -> state_document:
 	page = state["pages"][6]
-	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "7"})
+	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "7"})
 	return {"document_output": response["avatar_output"]}
 async def eighth_page_summary(state: state_document) -> state_document:
 	page = state["pages"][7]
-	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "8"})
+	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "8"})
 	return {"document_output": response["avatar_output"]}
 async def ninth_page_summary(state: state_document) -> state_document:
 	page = state["pages"][8]
-	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "9"})
+	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "9"})
 	return {"document_output": response["avatar_output"]}
 async def tenth_page_summary(state: state_document) -> state_document:
 	page = state["pages"][9]
-	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "10"})
+	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "10"})
 	return {"document_output": response["avatar_output"]}
 async def eleventh_page_summary(state: state_document) -> state_document:
 	page = state["pages"][10]
-	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "11"})
+	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "11"})
 	return {"document_output": response["avatar_output"]}
 async def twelvth_page_summary(state: state_document) -> state_document:
 	page = state["pages"][11]
-	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "12"})
+	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "12"})
 	return {"document_output": response["avatar_output"]}
 async def thirten_page_summary(state: state_document) -> state_document:
 	page = state["pages"][12]
-	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "13"})
+	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "13"})
 	return {"document_output": response["avatar_output"]}
 async def fourteen_page_summary(state: state_document) -> state_document:
 	page = state["pages"][13]
-	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "14"})
+	response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "14"})
 	return {"document_output": response["avatar_output"]}
 async def fifteen_page_summary(state: state_document) -> state_document:
     page = state["pages"][14]
-    response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "15"})
+    response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "15"})
     return {"document_output": response["avatar_output"]}
 async def sixteenth_page_summary(state: state_document) -> state_document:
     page = state["pages"][15]
-    response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "16"})
+    response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "16"})
     return {"document_output": response["avatar_output"]}
 async def seventeenth_page_summary(state: state_document) -> state_document:
     page = state["pages"][16]
-    response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "id": "17"})
+    response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "17"})
     return {"document_output": response["avatar_output"]}
 async def start_conversation(state: state_document) -> state_document:
 	"""Generate an engaging introduction for the first page of the document."""
 	first_page = state["pages"][0]
+	main_language = state.get("main_language", "English")
+	second_language = state.get("second_language", "English")
+	
+	multilingual_note = ""
+	if main_language != "English" or second_language != "English":
+		multilingual_note = f"\nUse {main_language} for all welcoming statements and examples. Use {second_language} only for any technical terms if needed."
 
-	system_prompt = """You are an enthusiastic educational host introducing a fascinating learning journey!
+	system_prompt = f"""You are an enthusiastic educational host introducing a fascinating learning journey!
 
 Your job is to create an ENGAGING, EXCITING introduction that:
 1. Greets the student warmly and excitingly (e.g., "Hello! Today we're going to explore the marvelous universe of programming!")
@@ -667,6 +801,7 @@ Your job is to create an ENGAGING, EXCITING introduction that:
 5. Builds excitement and curiosity for what's to come
 
 TONE: Enthusiastic, friendly, inspiring, like a passionate teacher welcoming students to class
+{multilingual_note}
 
 Generate the opening introduction speech (2-3 sentences max, keep it punchy and exciting!):"""
 	
@@ -685,6 +820,13 @@ Generate the opening introduction speech (2-3 sentences max, keep it punchy and 
 async def end_conversation(state: state_document) -> state_document:
     """Generate a meaningful closing for the last page of the document."""
     last_page = state["pages"][-1]
+    main_language = state["main_language"]
+    second_language = state["second_language"]
+    
+    multilingual_note = ""
+    if main_language != "English" or second_language != "English":
+        multilingual_note = f"\nUse {main_language} for all closing statements and gratitude. Use {second_language} only for any technical terms if needed."
+    
     prompt = f"""You are an enthusiastic educational host concluding an amazing learning journey!
 
  YOUR TASK:
@@ -698,6 +840,7 @@ Your job is to create a MEANINGFUL, INSPIRING conclusion that:
 5. Encourages continued exploration and curiosity
 
  TONE: Warm, celebratory, grateful, like ending a great class with motivation
+ {multilingual_note}
 
  LAST PAGE CONTENT:
 {last_page}
@@ -761,6 +904,21 @@ def children_safety_check(input: str) -> content_safety_response:
     data.append(sys)
     data.append(human)
     response = children_safety_structured_llm.invoke(data)
+    return response
+
+@tool
+def detect_mental_health_risk(user_text: str) -> mental_health_risk_response:
+    """Detect possible distress crisis signals (hyper-stress, severe anxiety, self-harm/suicide risk) in user text.
+
+    Use this tool whenever a user message suggests emotional crisis, panic, hopelessness, self-harm,
+    or suicidal thoughts/intent. This tool is for risk triage classification only.
+    """
+    data = []
+    sys = SystemMessage(content=mental_health_risk_classifier_prompt)
+    human = HumanMessage(content=user_text)
+    data.append(sys)
+    data.append(human)
+    response = mental_health_risk_structured_llm.invoke(data)
     return response
 #end of the defr to  protect the children from any harmful content
 #start  for teh tools for teh quiz and the document generation
@@ -1120,6 +1278,7 @@ def redirect_to_tabs(tab_name: str, runtime: ToolRuntime[Context]) :
 tool_long_term=[
     store_long_term_data,
     retrieve_long_term_data, 
+    detect_mental_health_risk,
     redirect_to_quiz,  
     redirect_to_document, 
     redirect_to_tabs,
@@ -1138,11 +1297,10 @@ one_page_workflow.add_node("emotionless script",script)
 one_page_workflow.add_node("avatar script",avatar)
 one_page_workflow.add_node("tts avatar", tts_avatar)
 one_page_workflow.add_edge(START,  "emotionless script")
-#one_page_workflow.add_edge("load_pdf", "emotionless script")
-#one_page_workflow.add_edge("summrize document", "emotionless script")
-one_page_workflow.add_edge("emotionless script","avatar script")
-one_page_workflow.add_edge("avatar script", "tts avatar")
-one_page_workflow.add_edge("tts avatar", END)
+one_page_workflow.add_edge("emotionless script", END)
+#one_page_workflow.add_edge("emotionless script","avatar script")
+#one_page_workflow.add_edge("avatar script", "tts avatar")
+#one_page_workflow.add_edge("tts avatar", END)
 one_page_chain = one_page_workflow.compile()
 
 agent_avatar = StateGraph(state_document)
@@ -1190,7 +1348,7 @@ RAG.add_edge("store_redis_db", END)
 RAG_chain = RAG.compile()
 #ent RAG workflow 
 @app.get("/")
-async def index(user_id: str):
+async def root(user_id: str):
     namespace=(user_id,"memories")
     personal_data=store.get(namespace,"a-memory")
     prompt = f"""Welcome back, {personal_data}!
@@ -1260,12 +1418,12 @@ async def chatbot(user_input: str, thr_id:str, usr_id: str, file: UploadFile | N
             pass
     return {"aimessage": test }#, "content_safety_response": child_protector}
 @app.post('/avatar/')
-async def avatar_script(target_age: str, file: UploadFile | None = None):
+async def avatar_script(target_age: str, main_language: str, second_language: str, file: UploadFile | None = None):
    if file and file.filename:
         file_path = os.path.join(UPLOAD_FOLDER, file.filename)
         with open(file_path, "wb") as buffer:
             copyfileobj(file.file, buffer)
-        test_input = {"pdf_path": file_path, "target_age": target_age }#exchange it later to be compatible with  state or else the error will persist
+        test_input = {"pdf_path": file_path, "target_age": target_age, "main_language": main_language, "second_language": second_language }#exchange it later to be compatible with  state or else the error will persist
         avatar_result  = await avatar_chain.ainvoke(test_input)
         return avatar_result["document_output"]
 @app.post('/evaluate/')
@@ -1315,8 +1473,11 @@ async def retrieve(query: str, input: str):
     )
     try:
         results = index.query(query)
+        paragraphs = [item["paragraph"] for item in results]
+        for p in paragraphs:
+           print("retrieved paragraph:", p)
     except Exception as e:
         return {"error": f"Query error: {e}"}
-    return {"results": results}
+    return {"results": results, "paragraphs": paragraphs}
 
 
