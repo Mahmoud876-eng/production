@@ -25,8 +25,8 @@ from redisvl.index import SearchIndex
 from redis import Redis
 from redisvl.query import VectorQuery
 from langchain_azure_ai.chat_models import AzureAIOpenAIApiChatModel
-
-
+from langchain_openai import AzureChatOpenAI, AzureOpenAI, AzureOpenAIEmbeddings 
+from openai import AzureOpenAI
 # Load environment variables
 load_dotenv()
 
@@ -37,32 +37,48 @@ app = FastAPI()
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 #azure api configuration
-endpoint = (os.getenv("AZURE_AI_INFERENCE_ENDPOINT") or os.getenv("endpoint") or "").strip().rstrip("/")
-# For /openai/v1 endpoints, api-version is optional; use only AZURE_OPENAI_API_VERSION when explicitly set.
-# Ignore legacy `api_version` env var to avoid accidental unsupported preview versions.
-api_version = os.getenv("AZURE_OPENAI_API_VERSION", "").strip()
-credential = (
-    os.getenv("AZURE_AI_INFERENCE_CREDENTIAL")
-    or os.getenv("AZURE_AI_INFERENCE_CREDENTIAL")
-    or os.getenv("key")
-    or ""
-).strip()
+key=os.getenv("AZURE_AI_INFERENCE_CREDENTIAL")
+api= os.getenv("AZURE_AI_INFERENCE_ENDPOINT")  
+llm = AzureAIOpenAIApiChatModel(
+    endpoint=api,
+    credential=key,
+    model="Mistral-Large-3",
+)
+hack_api= os.getenv("hack_api")
+hack_key= os.getenv("hack_key")
 
-if not endpoint or not credential:
-    raise ValueError(
-        "Azure AI configuration missing. Set AZURE_AI_INFERENCE_ENDPOINT and "
-        "AZURE_AI_INFERENCE_CREDENTIAL (or AZURE_AI_CREDENTIAL)."
+scriptllm = AzureAIOpenAIApiChatModel(
+    endpoint=hack_api,
+    credential=hack_key,
+    model="Llama-4-Maverick-17B-128E-Instruct-FP8",
+)
+emotionsllm = AzureAIOpenAIApiChatModel(
+    endpoint=api,
+    credential=key,
+    model="Llama-4-Maverick-17B-128E-Instruct-FP8",
+)
+
+tts_client = AzureOpenAI(
+    api_key=key,
+    api_version="2025-01-01-preview",  # must support audio
+    azure_endpoint="https://issam-mmottwx5-eastus2.cognitiveservices.azure.com",
+)
+embedding = AzureAIOpenAIApiChatModel(
+    endpoint=hack_api,
+    credential=hack_key,
+    model="text-embedding-3-large",
+)
+tts = tts_client.audio.speech.create(
+    model="gpt-4o-mini-tts",   
+    voice="alloy",              
+    input="good moning hope u doing well",
+    instructions="Speak in a friendly, calm tone.",
+    response_format="mp3",      
     )
 
-model_kwargs = {
-    "endpoint": endpoint,
-    "credential": credential,
-    "model": "Mistral-Large-3",
-}
-if api_version:
-    model_kwargs["api_version"] = api_version
-
-llm = AzureAIOpenAIApiChatModel(**model_kwargs)
+# Save audio to MP3 file
+os.makedirs("./recording", exist_ok=True)
+tts.stream_to_file("./recording/avatar_response.mp3")
 #end azure api configuration
 
 # Google API configuration
@@ -89,7 +105,7 @@ query_embeddings = GoogleGenerativeAIEmbeddings(
     model="gemini-embedding-001",
     task_type="RETRIEVAL_QUERY"
 )
-tts= ChatGoogleGenerativeAI(
+ttsy= ChatGoogleGenerativeAI(
     model="gemini-2.5-flash-preview-tts",
 	response_modalities=["AUDIO"],
     model_kwargs={
@@ -379,6 +395,7 @@ class state(TypedDict):
     main_language: str
     second_language: str
     main_topic: str
+    error: str
 
 
 class state_document(MessagesState):
@@ -391,7 +408,7 @@ class state_document(MessagesState):
     document_output: Annotated[str, operator.add]
 class state_RAG(TypedDict):
     pdf_path: str
-    paragraphs: list
+    pages: list
     embeddings: list
     final_output: list[dict]
     error: Optional[Annotated[str, operator.add]]  
@@ -607,6 +624,13 @@ LANGUAGE MIXING STRATEGY:
     
     system_prompt = f"""Transform this educational page into a clear, engaging learning script.
 
+STRICT BOUNDARY (VERY IMPORTANT):
+- Explain ONLY the page content provided.
+- Do NOT add any opening greeting, intro line, title card, welcome text, or scene-setting.
+- Do NOT add any ending, conclusion, wrap-up, farewell, thank-you line, or motivational closing.
+- Do NOT prepend or append anything outside the page explanation itself.
+- Start directly from explaining the first idea in the page, and stop when the page explanation is complete.
+
 REQUIREMENTS:
 
 1. CLARITY:
@@ -635,7 +659,7 @@ REQUIREMENTS:
    - Patient and supportive
    - Foster genuine curiosity about the topic
 
-Transform this page into an engaging educational explanation without artificially adding introduction/conclusion—just enhance and clarify what's already here.{multilingual_instructions}"""
+Transform this page into an engaging educational explanation by enhancing and clarifying only what is already in the page content.{multilingual_instructions}"""
 	
     user_message = f"""PAGE CONTENT:
 {state["page"]}
@@ -648,9 +672,12 @@ Create a smooth, flowing educational explanation of this page's content."""
 		HumanMessage(content=user_message)
 	]
 	
-    script_response = await llm.ainvoke(messages)
+    script_response = await scriptllm.ainvoke(messages)
     #state["script_avatar"] = str(script_response.content)
-    state["avatar_output"] = str(script_response.content)
+    state["script_avatar"] = str(script_response.content)
+
+    
+    
     return state
 async def avatar(state: state) -> state:
     system_prompt = f"""You are a voice director for Gemini TTS.
@@ -690,7 +717,7 @@ Rules:
 		HumanMessage(content=user_message)
 	]
 	
-    avatar_response = await llm.ainvoke(messages)
+    avatar_response = await emotionsllm.ainvoke(messages)
     state["avatar_output"] = str(avatar_response.content)
     return state
 import asyncio
@@ -704,13 +731,12 @@ def wave_file(filename, pcm, channels=1, rate=24000, sample_width=2):
       wf.setframerate(rate)
       wf.writeframes(pcm)
 async def tts_avatar(state: state) -> state:
-	"""Convert marked performance script to audio using Gemini TTS."""
-	result = await tts.ainvoke(state["avatar_output"])
-	
-	# Save audio to WAV file
-	file_name = f'./recording/{state["id"]}.wav'
-	wave_file(file_name, result.additional_kwargs["audio"])
-	return state
+    """Convert marked performance script to audio using Gemini TTS."""
+    result = await tts.ainvoke(state["avatar_output"])
+    # Save audio to WAV file
+    file_name = f'./recording/{state["id"]}.wav'
+    wave_file(file_name, result.additional_kwargs["audio"])
+    return state
 
 async def second_page_summary(state: state_document) -> state_document:
 	page = state["pages"][1]
@@ -781,6 +807,7 @@ async def seventeenth_page_summary(state: state_document) -> state_document:
     page = state["pages"][16]
     response = await one_page_chain.ainvoke({"page": page, "target_age": state["target_age"], "main_language": state["main_language"], "second_language": state["second_language"], "id": "17"})
     return {"document_output": response["avatar_output"]}
+
 async def start_conversation(state: state_document) -> state_document:
 	"""Generate an engaging introduction for the first page of the document."""
 	first_page = state["pages"][0]
@@ -852,7 +879,7 @@ Generate the closing speech (2-3 sentences max, memorable and motivational):
     #state["avatar_output"] = response.content
     return {"avatar_output": response.content}
 
-def conditional_edge(state: state_document) -> Literal["2", "3", "4", "5", "6", "7", "8", "9", "10", "end_conversation"]:
+def conditional_edge(state: state_document) -> Literal["2", "3", "4", "5", "6", "7", "8", "9", "10","11","12","13", "14","15","16","17", "end_conversation"]:
     """Determine if we should ship to user based on overall score."""
     page = len(state["pages"])
     pages = []
@@ -864,7 +891,8 @@ def conditional_edge(state: state_document) -> Literal["2", "3", "4", "5", "6", 
 # start of the RAG functions
 def get_embedding(state: state_RAG) -> state_RAG:
     try:
-        data=doc_embeddings.embed_documents( state["paragraphs"])
+        data=doc_embeddings.embed_documents( state["pages"])
+       
     except Exception as e:
         return {"error": str(e)}
     return {"embeddings": data}
@@ -872,7 +900,7 @@ import numpy as np
 def prepare_for_vector_store(state: state_RAG) -> state_RAG:
     vector_store_data=[]
     i=-1
-    for text in state["paragraphs"]:
+    for text in state["pages"]:
         i+=1
         embedding = state["embeddings"][i]
         try:
@@ -1297,8 +1325,8 @@ one_page_workflow.add_node("emotionless script",script)
 one_page_workflow.add_node("avatar script",avatar)
 one_page_workflow.add_node("tts avatar", tts_avatar)
 one_page_workflow.add_edge(START,  "emotionless script")
-one_page_workflow.add_edge("emotionless script", END)
-#one_page_workflow.add_edge("emotionless script","avatar script")
+one_page_workflow.add_edge("emotionless script","avatar script")
+one_page_workflow.add_edge("avatar script", END)            
 #one_page_workflow.add_edge("avatar script", "tts avatar")
 #one_page_workflow.add_edge("tts avatar", END)
 one_page_chain = one_page_workflow.compile()
@@ -1323,6 +1351,17 @@ agent_avatar.add_node("15",fifteen_page_summary)
 agent_avatar.add_node("16",sixteenth_page_summary)
 agent_avatar.add_node("17",seventeenth_page_summary)
 agent_avatar.add_node("end_conversation",end_conversation)
+agent_avatar.add_node("avatar script",avatar)
+agent_avatar.add_node("tts avatar", tts_avatar)
+#agent_avatar.add_edge(START, "load_pdf")
+#agent_avatar.add_edge("load_pdf", "start_conversation")
+#agent_avatar.add_conditional_edges("start_conversation", conditional_edge)
+#agent_avatar.add_edge("start_conversation", "avatar script")
+#agent_avatar.add_edge("avatar script", "tts avatar")
+#agent_avatar.add_edge("tts avatar", "end_conversation")
+#agent_avatar.add_edge("end_conversation", "avatar script")
+#agent_avatar.add_edge("avatar script", "tts avatar")
+#agent_avatar.add_edge("tts avatar", END)
 agent_avatar.add_edge(START, "load_pdf")
 agent_avatar.add_edge("load_pdf", "start_conversation")
 agent_avatar.add_conditional_edges("start_conversation", conditional_edge)
@@ -1459,9 +1498,9 @@ async def process_pdf(pdf: UploadFile):
     pdf_path = os.path.join(UPLOAD_FOLDER, pdf.filename)
     with open(pdf_path, "wb") as f:
         copyfileobj(pdf.file, f)
-    final_state = RAG_chain.invoke({"pdf_path": pdf_path})
+    final_state = await RAG_chain.ainvoke({"pdf_path": pdf_path})
     #Return the final output as JSON response
-    return {"status": "File processed successfully and indexed in vector database"}
+    return {"status": "File processed successfully and indexed in vector database" }
 @app.post("/retrieve/")
 async def retrieve(query: str, input: str):
     query_embedding = query_embeddings.embed_query(query)
@@ -1476,8 +1515,28 @@ async def retrieve(query: str, input: str):
         paragraphs = [item["paragraph"] for item in results]
         for p in paragraphs:
            print("retrieved paragraph:", p)
+        
+        # Generate explanation using LLM based on retrieved data
+        retrieved_context = "\n".join(paragraphs)
+        system_prompt = """You are an expert assistant that explains complex information in a clear and concise manner. 
+            Your role is to analyze user queries and explain them based on retrieved relevant data. 
+            Provide accurate, helpful explanations that connect the user's input with the retrieved information."""
+                    
+        user_prompt = f"""Based on the following retrieved data, please explain the user's query in detail.
+
+            User Query: {input}
+
+            Retrieved Data:
+            {retrieved_context}
+
+            Please provide a comprehensive explanation that addresses the user's query using the retrieved information."""
+                    
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
+        ]
+        explanation = llm.invoke(messages)
+        
     except Exception as e:
         return {"error": f"Query error: {e}"}
-    return {"results": results, "paragraphs": paragraphs}
-
-
+    return {"results": results, "paragraphs": paragraphs, "explanation": explanation}
