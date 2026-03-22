@@ -730,12 +730,23 @@ def wave_file(filename, pcm, channels=1, rate=24000, sample_width=2):
       wf.setsampwidth(sample_width)
       wf.setframerate(rate)
       wf.writeframes(pcm)
+
 async def tts_avatar(state: state) -> state:
     """Convert marked performance script to audio using Gemini TTS."""
-    result = await tts.ainvoke(state["avatar_output"])
+    #result = await tts.ainvoke(state["avatar_output"])
     # Save audio to WAV file
-    file_name = f'./recording/{state["id"]}.wav'
-    wave_file(file_name, result.additional_kwargs["audio"])
+    tts_response = tts_client.audio.speech.create(
+        model="gpt-4o-mini-tts",
+        voice="alloy",
+        input=state["avatar_output"],
+        instructions="Speak in a friendly, calm tone.",
+        response_format="mp3",
+    )
+    file_id = state["id"]
+    file_name = f"./recording/c{file_id}.wav"
+    os.makedirs("./recording", exist_ok=True)
+    tts_response.stream_to_file(file_name)
+    #wave_file(file_name, result.additional_kwargs["audio"])
     return state
 
 async def second_page_summary(state: state_document) -> state_document:
@@ -809,16 +820,16 @@ async def seventeenth_page_summary(state: state_document) -> state_document:
     return {"document_output": response["avatar_output"]}
 
 async def start_conversation(state: state_document) -> state_document:
-	"""Generate an engaging introduction for the first page of the document."""
-	first_page = state["pages"][0]
-	main_language = state.get("main_language", "English")
-	second_language = state.get("second_language", "English")
-	
-	multilingual_note = ""
-	if main_language != "English" or second_language != "English":
-		multilingual_note = f"\nUse {main_language} for all welcoming statements and examples. Use {second_language} only for any technical terms if needed."
+    """Generate an engaging introduction for the first page of the document."""
+    first_page = state["pages"][0]
+    main_language = state.get("main_language", "English")
+    second_language = state.get("second_language", "English")
 
-	system_prompt = f"""You are an enthusiastic educational host introducing a fascinating learning journey!
+    multilingual_note = ""
+    if main_language != "English" or second_language != "English":
+        multilingual_note = f"\nUse {main_language} for all welcoming statements and examples. Use {second_language} only for any technical terms if needed."
+
+    system_prompt = f"""You are an enthusiastic educational host introducing a fascinating learning journey!
 
 Your job is to create an ENGAGING, EXCITING introduction that:
 1. Greets the student warmly and excitingly (e.g., "Hello! Today we're going to explore the marvelous universe of programming!")
@@ -831,18 +842,28 @@ TONE: Enthusiastic, friendly, inspiring, like a passionate teacher welcoming stu
 {multilingual_note}
 
 Generate the opening introduction speech (2-3 sentences max, keep it punchy and exciting!):"""
-	
-	user_message = f"""This is the FIRST PAGE of the content:
+
+    user_message = f"""This is the FIRST PAGE of the content:
 {first_page}"""
-	
-	messages = [
-		SystemMessage(content=system_prompt),
-		HumanMessage(content=user_message)
-	]
-	
-	response = llm.invoke(messages)
-	intro_text = response.content if hasattr(response, "content") else str(response)
-	return {"avatar_output": intro_text}
+
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_message)
+    ]
+
+    response = llm.invoke(messages)
+    intro_text = response.content 
+    tts_response = tts_client.audio.speech.create(
+        model="gpt-4o-mini-tts",
+        voice="alloy",
+        input=intro_text,
+        instructions="Speak in a friendly, calm tone.",
+        response_format="mp3",
+    )
+    file_name = "./recording/c1.wav"
+    os.makedirs("./recording", exist_ok=True)
+    tts_response.stream_to_file(file_name)
+    return {"avatar_output": intro_text}
 
 async def end_conversation(state: state_document) -> state_document:
     """Generate a meaningful closing for the last page of the document."""
@@ -877,7 +898,18 @@ Generate the closing speech (2-3 sentences max, memorable and motivational):
     
     response = llm.invoke(prompt)
     #state["avatar_output"] = response.content
-    return {"avatar_output": response.content}
+    end_text = response.content if hasattr(response, "content") else str(response)
+    tts_response = tts_client.audio.speech.create(
+        model="gpt-4o-mini-tts",
+        voice="alloy",
+        input=end_text,
+        instructions="Speak in a friendly, calm tone.",
+        response_format="mp3",
+    )
+    file_name = "./recording/cend.wav"
+    os.makedirs("./recording", exist_ok=True)
+    tts_response.stream_to_file(file_name)
+    return {"avatar_output": end_text}
 
 def conditional_edge(state: state_document) -> Literal["2", "3", "4", "5", "6", "7", "8", "9", "10","11","12","13", "14","15","16","17", "end_conversation"]:
     """Determine if we should ship to user based on overall score."""
@@ -1326,9 +1358,9 @@ one_page_workflow.add_node("avatar script",avatar)
 one_page_workflow.add_node("tts avatar", tts_avatar)
 one_page_workflow.add_edge(START,  "emotionless script")
 one_page_workflow.add_edge("emotionless script","avatar script")
-one_page_workflow.add_edge("avatar script", END)            
-#one_page_workflow.add_edge("avatar script", "tts avatar")
-#one_page_workflow.add_edge("tts avatar", END)
+#one_page_workflow.add_edge("avatar script", END)            
+one_page_workflow.add_edge("avatar script", "tts avatar")
+one_page_workflow.add_edge("tts avatar", END)
 one_page_chain = one_page_workflow.compile()
 
 agent_avatar = StateGraph(state_document)
@@ -1366,6 +1398,7 @@ agent_avatar.add_edge(START, "load_pdf")
 agent_avatar.add_edge("load_pdf", "start_conversation")
 agent_avatar.add_conditional_edges("start_conversation", conditional_edge)
 agent_avatar.add_edge("end_conversation", END)
+#agent_avatar.add_edge("tts avatar", END)    
 avatar_chain = agent_avatar.compile()
 #ent sub Graph
 
